@@ -1,0 +1,233 @@
+#!/bin/sh
+
+set -u
+
+USER_ID=0
+
+die()
+{
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+usage()
+{
+    echo "Usage: $0 PROFILE" >&2
+    exit 2
+}
+
+adb_shell()
+{
+    adb shell "$@"
+}
+
+package_list_contains()
+{
+    package=$1
+    shift
+
+    packages=$(adb_shell pm list packages "$@" "$package") ||
+        die "cannot query package state: $package"
+
+    printf '%s\n' "$packages" | tr -d '\r' | grep -Fxq "package:$package"
+}
+
+package_installed()
+{
+    package_list_contains "$1" --user "$USER_ID"
+}
+
+package_exists()
+{
+    package_list_contains "$1" -u --user "$USER_ID"
+}
+
+package_enabled()
+{
+    package_list_contains "$1" -e --user "$USER_ID"
+}
+
+check_device()
+{
+    manufacturer=$(adb_shell getprop ro.product.manufacturer) ||
+        die "cannot read ro.product.manufacturer"
+    manufacturer=$(printf '%s' "$manufacturer" | tr -d '\r')
+    model=$(adb_shell getprop ro.product.model) ||
+        die "cannot read ro.product.model"
+    model=$(printf '%s' "$model" | tr -d '\r')
+    device=$(adb_shell getprop ro.product.device) ||
+        die "cannot read ro.product.device"
+    device=$(printf '%s' "$device" | tr -d '\r')
+
+    [ "$manufacturer" = "$DEVICE_MANUFACTURER" ] ||
+        die "wrong manufacturer: expected '$DEVICE_MANUFACTURER', got '$manufacturer'"
+
+    [ "$model" = "$DEVICE_MODEL" ] ||
+        die "wrong model: expected '$DEVICE_MODEL', got '$model'"
+
+    [ "$device" = "$DEVICE_DEVICE" ] ||
+        die "wrong device: expected '$DEVICE_DEVICE', got '$device'"
+
+    echo "DEVICE    $manufacturer / $model / $device"
+}
+
+restore_package()
+{
+    package=$1
+
+    if package_installed "$package"; then
+        return 0
+    fi
+
+    if ! package_exists "$package"; then
+        echo "ERROR: package does not exist: $package" >&2
+        return 1
+    fi
+
+    echo "RESTORE   $package"
+
+    adb_shell cmd package install-existing \
+        --user "$USER_ID" "$package" >/dev/null || return 1
+
+    package_installed "$package"
+}
+
+enable_package()
+{
+    package=$1
+
+    package_installed "$package" ||
+        return 1
+
+    if package_enabled "$package"; then
+        return 0
+    fi
+
+    echo "ENABLE    $package"
+
+    adb_shell pm enable \
+        --user "$USER_ID" "$package" >/dev/null || return 1
+
+    package_enabled "$package"
+}
+
+remove_package()
+{
+    package=$1
+
+    if ! package_installed "$package"; then
+        echo "REMOVED   $package"
+        return 0
+    fi
+
+    echo "REMOVE    $package"
+
+    adb_shell pm uninstall \
+        --user "$USER_ID" "$package" >/dev/null || return 1
+
+    ! package_installed "$package"
+}
+
+ensure_launcher()
+{
+    echo
+    echo '===== LAUNCHER ====='
+
+    restore_package "$STOCK_LAUNCHER" ||
+        die "cannot restore launcher: $STOCK_LAUNCHER"
+
+    enable_package "$STOCK_LAUNCHER" ||
+        die "cannot enable launcher: $STOCK_LAUNCHER"
+
+    echo "ENABLED   $STOCK_LAUNCHER"
+}
+
+clean_packages()
+{
+    echo
+    echo '===== DEBLOAT ====='
+
+    clean_status=0
+    for package in $REMOVE_PACKAGES; do
+        if ! remove_package "$package"; then
+            echo "ERROR: cannot remove $package" >&2
+            clean_status=1
+        fi
+    done
+    return "$clean_status"
+}
+
+report()
+{
+    echo
+    echo '===== RESULT ====='
+
+    for package in $REMOVE_PACKAGES; do
+        if package_installed "$package"; then
+            echo "PRESENT   $package"
+        else
+            echo "REMOVED   $package"
+        fi
+    done
+
+    echo
+    echo '===== LAUNCHER STATE ====='
+
+    if package_enabled "$STOCK_LAUNCHER"; then
+        echo "ENABLED   $STOCK_LAUNCHER"
+    elif package_installed "$STOCK_LAUNCHER"; then
+        echo "DISABLED  $STOCK_LAUNCHER"
+    else
+        echo "MISSING   $STOCK_LAUNCHER"
+    fi
+}
+
+[ "$#" -eq 1 ] || usage
+
+PROFILE=$1
+case $PROFILE in
+    /* | ./* | ../*) ;;
+    *) PROFILE=./$PROFILE ;;
+esac
+
+[ -f "$PROFILE" ] ||
+    die "profile not found: $PROFILE"
+
+# shellcheck source=/dev/null
+. "$PROFILE"
+
+: "${DEVICE_MANUFACTURER:?DEVICE_MANUFACTURER is not defined in profile}"
+: "${DEVICE_MODEL:?DEVICE_MODEL is not defined in profile}"
+: "${DEVICE_DEVICE:?DEVICE_DEVICE is not defined in profile}"
+: "${STOCK_LAUNCHER:?STOCK_LAUNCHER is not defined in profile}"
+: "${REMOVE_PACKAGES:?REMOVE_PACKAGES is not defined in profile}"
+
+# Profiles are trusted shell code. Never remove the fallback launcher.
+set -f
+for package in $REMOVE_PACKAGES; do
+    [ "$package" != "$STOCK_LAUNCHER" ] ||
+        die "stock launcher is in REMOVE_PACKAGES: $package"
+done
+
+command -v adb >/dev/null 2>&1 ||
+    die "adb not found"
+
+adb get-state >/dev/null 2>&1 ||
+    die "ADB device is not connected"
+
+echo '===== DEVICE ====='
+
+#
+# Fail closed before performing any modifying operation.
+#
+check_device
+
+#
+# Keep the stock launcher installed and enabled as a fallback.
+#
+ensure_launcher
+
+status=0
+clean_packages || status=1
+report
+exit "$status"
